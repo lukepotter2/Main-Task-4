@@ -1,0 +1,262 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+//=====[Defines]===============================================================
+
+#define NUMBER_OF_KEYS                           4
+#define BLINKING_TIME_GAS_ALARM               1000
+#define BLINKING_TIME_OVER_TEMP_ALARM          500
+#define BLINKING_TIME_GAS_AND_OVER_TEMP_ALARM  100
+#define NUMBER_OF_AVG_SAMPLES                   100
+#define OVER_TEMP_LEVEL                         33
+#define TIME_INCREMENT_MS                       10
+#define GAS_THRESHOLD                           0.9  
+#define DISPLAY_UPDATE_INTERVAL                 1000    
+
+//=====[Declaration and initialization of public global objects]===============
+
+DigitalIn enterButton(BUTTON1);
+DigitalIn alarmTestButton(D2);
+DigitalIn aButton(D4);
+DigitalIn bButton(D5);
+DigitalIn cButton(D6);
+DigitalIn dButton(D7);
+AnalogIn gasSensor(A2);
+
+DigitalOut alarmLed(LED1);
+DigitalOut incorrectCodeLed(LED3);
+DigitalOut systemBlockedLed(LED2);
+
+DigitalInOut sirenPin(PE_10);
+
+UnbufferedSerial uartUsb(USBTX, USBRX, 115200);
+
+AnalogIn potentiometer(A0);
+AnalogIn lm35(A1);
+
+//=====[Declaration and initialization of public global variables]=============
+
+bool alarmState    = OFF;
+bool incorrectCode = false;
+bool overTempDetector = OFF;
+
+int numberOfIncorrectCodes = 0;
+int buttonBeingCompared    = 0;
+int codeSequence[NUMBER_OF_KEYS]   = { 1, 1, 0, 0 };
+int buttonsPressed[NUMBER_OF_KEYS] = { 0, 0, 0, 0 };
+int accumulatedTimeAlarm = 0;
+int displayUpdateCounter = 0;  
+
+bool gasDetectorState          = OFF;
+bool overTempDetectorState     = OFF;
+
+float potentiometerReading = 0.0;
+float lm35ReadingsAverage  = 0.0;
+float lm35ReadingsSum      = 0.0;
+float lm35ReadingsArray[NUMBER_OF_AVG_SAMPLES];
+float lm35TempC            = 0.0;
+float gasReading           = 0.0;
+
+//=====[Declarations (prototypes) of public functions]=========================
+
+void inputsInit();
+void outputsInit();
+void alarmActivationUpdate();
+void alarmDeactivationUpdate();
+void uartTask();
+void availableCommands();
+bool areEqual();
+float celsiusToFahrenheit(float tempInCelsiusDegrees);
+float analogReadingScaledWithTheLM35Formula(float analogReading);
+
+//=====[Main function]=========================================================
+
+int main()
+{
+    inputsInit();
+    outputsInit();
+    while (true) {
+        alarmActivationUpdate();
+        alarmDeactivationUpdate();
+        uartTask();
+        delay(TIME_INCREMENT_MS);
+    }
+}
+
+//=====[Implementations of public functions]===================================
+
+void inputsInit()
+{
+    alarmTestButton.mode(PullDown);
+    aButton.mode(PullDown);
+    bButton.mode(PullDown);
+    cButton.mode(PullDown);
+    dButton.mode(PullDown);
+    sirenPin.mode(OpenDrain);
+    sirenPin.input();
+}
+
+void outputsInit()
+{
+    alarmLed = OFF;
+    incorrectCodeLed = OFF;
+    systemBlockedLed = OFF;
+}
+
+void alarmActivationUpdate()
+{
+    static int lm35SampleIndex = 0;
+    char str[100];
+    int stringLength;
+
+    lm35ReadingsArray[lm35SampleIndex] = lm35.read();
+    lm35SampleIndex++;
+    if (lm35SampleIndex >= NUMBER_OF_AVG_SAMPLES) {
+        lm35SampleIndex = 0;
+    }
+    
+    lm35ReadingsSum = 0.0;
+    for (int i = 0; i < NUMBER_OF_AVG_SAMPLES; i++) {
+        lm35ReadingsSum += lm35ReadingsArray[i];
+    }
+    lm35ReadingsAverage = lm35ReadingsSum / NUMBER_OF_AVG_SAMPLES;
+    lm35TempC = analogReadingScaledWithTheLM35Formula(lm35ReadingsAverage);    
+    
+    overTempDetector = (lm35TempC > OVER_TEMP_LEVEL);
+    
+    gasReading = gasSensor.read();
+    gasDetectorState = (gasReading > GAS_THRESHOLD);
+
+    if (gasDetectorState || overTempDetector || alarmTestButton) {
+        alarmState = ON;
+        if (alarmTestButton) {
+            gasDetectorState = ON;
+            overTempDetectorState = ON;
+        }
+    }
+
+    if (alarmState) {
+        accumulatedTimeAlarm += TIME_INCREMENT_MS;
+        sirenPin.output();
+        sirenPin = LOW;
+
+        int blinkTime = (gasDetectorState && overTempDetectorState) ? 
+            BLINKING_TIME_GAS_AND_OVER_TEMP_ALARM :
+            (gasDetectorState ? BLINKING_TIME_GAS_ALARM : 
+            BLINKING_TIME_OVER_TEMP_ALARM);
+
+        if (accumulatedTimeAlarm >= blinkTime) {
+            accumulatedTimeAlarm = 0;
+            alarmLed = !alarmLed;
+        }
+    } else {
+        alarmLed = OFF;
+        gasDetectorState = OFF;
+        overTempDetectorState = OFF;
+        sirenPin.input();
+    }
+
+    displayUpdateCounter += TIME_INCREMENT_MS;
+    if (displayUpdateCounter >= DISPLAY_UPDATE_INTERVAL) {
+        displayUpdateCounter = 0;
+
+        potentiometerReading = potentiometer.read();
+        sprintf(str, "\r\nTemperature: %.2f C\r\n", lm35TempC);
+        uartUsb.write(str, strlen(str));
+        
+        sprintf(str, "Potentiometer: %.2f\r\n", potentiometerReading);
+        uartUsb.write(str, strlen(str));
+        
+        sprintf(str, "Gas Sensor: %.2f - %s\r\n", gasReading, 
+                gasDetectorState ? "DETECTED" : "NOT DETECTED");
+        uartUsb.write(str, strlen(str));
+        
+        if (alarmState) {
+            if (gasDetectorState && overTempDetectorState) {
+                uartUsb.write("Alarm Source: Gas and Temperature\r\n", 35);
+            } else if (gasDetectorState) {
+                uartUsb.write("Alarm Source: Gas Alarm\r\n", 25);
+            } else if (overTempDetector) {
+                uartUsb.write("Alarm Source: Temperature Alarm\r\n", 33);
+            }
+        } else {
+            uartUsb.write("Alarm Source: None\r\n", 20);
+        }
+    }
+}
+
+void alarmDeactivationUpdate()
+{
+    if (numberOfIncorrectCodes < 5) {
+        if (aButton && bButton && cButton && dButton && !enterButton) {
+            incorrectCodeLed = OFF;
+        }
+        if (enterButton && !incorrectCodeLed && alarmState) {
+            buttonsPressed[0] = aButton;
+            buttonsPressed[1] = bButton;
+            buttonsPressed[2] = cButton;
+            buttonsPressed[3] = dButton;
+            if (areEqual()) {
+                alarmState = OFF;
+                numberOfIncorrectCodes = 0;
+            } else {
+                incorrectCodeLed = ON;
+                numberOfIncorrectCodes++;
+            }
+        }
+    } else {
+        systemBlockedLed = ON;
+    }
+}
+
+void uartTask()
+{
+    char receivedChar = '\0';
+    char str[100];
+    if (uartUsb.readable()) {
+        uartUsb.read(&receivedChar, 1);
+        switch (receivedChar) {
+            case '1':
+                sprintf(str, "Alarm State: %s\r\n", alarmState ? "ON" : "OFF");
+                uartUsb.write(str, strlen(str));
+                break;
+            case '4':
+                uartUsb.write("Enter code (1100): ", 19);
+                break;
+            case '5':
+                uartUsb.write("Enter new code: ", 16);
+                break;
+            default:
+                availableCommands();
+                break;
+        }
+    }
+}
+
+void availableCommands()
+{
+    uartUsb.write("Available commands:\r\n", 21);
+    uartUsb.write("Press '1' for alarm state\r\n", 27);
+    uartUsb.write("Press '4' to enter code\r\n", 25);
+    uartUsb.write("Press '5' to set new code\r\n", 27);
+}
+
+bool areEqual()
+{
+    for (int i = 0; i < NUMBER_OF_KEYS; i++) {
+        if (codeSequence[i] != buttonsPressed[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+float analogReadingScaledWithTheLM35Formula(float analogReading)
+{
+    return (analogReading * 3.3 * 100);
+}
+
+float celsiusToFahrenheit(float tempInCelsiusDegrees)
+{
+    return (tempInCelsiusDegrees * 9.0 / 5.0 + 32.0);
+}
